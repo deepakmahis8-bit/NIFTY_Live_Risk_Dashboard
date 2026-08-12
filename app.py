@@ -85,19 +85,39 @@ try:
     n = obj.ltpData("NSE", "Nifty 50", "99926000")
 
     if not isinstance(n, dict):
-        raise RuntimeError(f"Unexpected NIFTY response: {n}")
+        raise RuntimeError(f"Unexpected Angel One response: {n}")
+
+    if n.get("status") is False:
+        msg = n.get("message") or n.get("errorcode") or "Unknown Angel One error"
+        raise RuntimeError(f"Angel One API error: {msg}")
 
     data = n.get("data")
 
-    if isinstance(data, dict):
+    if isinstance(data, dict) and isinstance(data.get("fetched"), list):
+        fetched = data.get("fetched")
+
+        if not fetched:
+            raise RuntimeError(
+                "NIFTY data is currently unavailable from Angel One."
+            )
+
+        ltp_value = fetched[0].get("ltp")
+
+    elif isinstance(data, dict):
         ltp_value = data.get("ltp")
+
     elif isinstance(data, list) and data:
         ltp_value = data[0].get("ltp")
+
     else:
-        raise RuntimeError(f"Unexpected NIFTY data format: {data}")
+        raise RuntimeError(
+            f"Unexpected NIFTY data format: {data}"
+        )
 
     if ltp_value is None:
-        raise RuntimeError(f"NIFTY LTP not found in response: {n}")
+        raise RuntimeError(
+            f"NIFTY LTP not found in Angel One response: {n}"
+        )
 
     nifty = num(ltp_value)
 
