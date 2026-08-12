@@ -1,0 +1,6 @@
+streamlit
+smartapi-python
+requests
+pyotp
+logzero
+websocket-client
