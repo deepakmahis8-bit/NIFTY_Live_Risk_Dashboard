@@ -82,8 +82,28 @@ for x in master:
 
 # ---------- NIFTY ----------
 try:
-    n= obj.ltpData("NSE","Nifty 50","99926000")
-    nifty=num(n["data"]["ltp"])
+    n = obj.ltpData("NSE", "Nifty 50", "99926000")
+
+    if not isinstance(n, dict):
+        raise RuntimeError(f"Unexpected NIFTY response: {n}")
+
+    data = n.get("data")
+
+    if isinstance(data, dict):
+        ltp_value = data.get("ltp")
+    elif isinstance(data, list) and data:
+        ltp_value = data[0].get("ltp")
+    else:
+        raise RuntimeError(f"Unexpected NIFTY data format: {data}")
+
+    if ltp_value is None:
+        raise RuntimeError(f"NIFTY LTP not found in response: {n}")
+
+    nifty = num(ltp_value)
+
+    if nifty <= 0:
+        raise RuntimeError(f"Invalid NIFTY LTP: {ltp_value}")
+
 except Exception as e:
     st.error(f"NIFTY live price error: {e}")
     st.stop()
