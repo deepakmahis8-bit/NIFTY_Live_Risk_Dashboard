@@ -211,79 +211,183 @@ else:
     st.warning(f"Greeks unavailable right now: {greek_error}")
     st.stop()
 
-# ---------- MODEL ----------
-# Uses local delta/gamma repricing + theta + vega stress.
-# Time estimate uses current day range as a coarse speed proxy; it is explicitly not a forecast.
-day_range=max(high-low,nifty*0.002)
-speed=max(day_range/390.0,nifty*0.000004)
-sl_minutes=max(1.0,abs(sl-nifty)/speed)
-target_minutes=max(1.0,abs(target-nifty)/speed)
+# ---------- SELECTED-STRIKE SL / TARGET MODEL ----------
+# IMPORTANT:
+# All SL/Target premium estimates start from the LIVE premium of the
+# EXACT option contract selected above (same expiry + same CE/PE + same strike).
+# They do NOT start from ATM premium or another strike's premium.
 
-def theoretical_premium(level,minutes,iv_shift):
-    d=level-nifty
-    p=ltp + delta*d + 0.5*gamma*d*d + theta*(minutes/(24*60)) + vega*iv_shift
-    return max(0.0,p)
+# A simple time proxy is used only for theta. It is not a market forecast.
+day_range = max(high - low, nifty * 0.002)
+speed = max(day_range / 390.0, nifty * 0.000004)
 
-# Base-case expected premiums at the user-selected NIFTY levels.
-sl_expected_premium=theoretical_premium(sl,sl_minutes,0.0)
-target_expected_premium=theoretical_premium(target,target_minutes,0.0)
-sl_premium_box.metric("Expected Premium @ NIFTY SL", f"₹{sl_expected_premium:,.2f}")
-target_premium_box.metric("Expected Premium @ NIFTY Target", f"₹{target_expected_premium:,.2f}")
+sl_minutes = max(1.0, abs(sl - nifty) / speed)
+target_minutes = max(1.0, abs(target - nifty) / speed)
 
-def exit_reference(p):
-    # For a long option, the executable-side reference is bid.
-    # If bid is unavailable, fall back to model price.
-    return min(p,bid) if bid>0 else p
+def expected_selected_premium(nifty_level, minutes):
+    """
+    Reprice the SAME selected option contract from its current live LTP.
+    Delta and Gamma are for the selected strike/expiry/CE-PE contract.
+    Theta is applied for the estimated time movement.
+    Vega is not stressed here, so IV is assumed unchanged.
+    """
+    d_nifty = nifty_level - nifty
 
-# Loss scenarios: "Favorable" is lower stress; Conservative is more adverse.
-loss_defs=[
-    ("Favorable",+1.0,0.95,0.0),
-    ("Base",0.0,1.00,0.0),
-    ("High Risk",-1.5,1.10,0.5),
-    ("Conservative",-3.0,1.25,1.0),
-]
-loss_rows=[]
-for name,iv_shift,stress,slip in loss_defs:
-    p=theoretical_premium(sl,sl_minutes,iv_shift)
-    px=max(0.0,exit_reference(p)*(1-slip/100))
-    loss=max(0.0,(entry-px))*qty*stress
-    loss_rows.append((name,p,px,loss))
+    estimated = (
+        ltp
+        + (delta * d_nifty)
+        + (0.5 * gamma * d_nifty * d_nifty)
+        + (theta * (minutes / (24 * 60)))
+    )
 
-profit_defs=[
-    ("Conservative",-2.0,0.90),
-    ("Base",0.0,1.00),
-    ("Favorable",+2.0,1.10),
-]
-profit_rows=[]
-for name,iv_shift,stress in profit_defs:
-    p=theoretical_premium(target,target_minutes,iv_shift)
-    px=max(0.0,exit_reference(p))
-    profit=max(0.0,(px-entry))*qty*stress
-    profit_rows.append((name,p,px,profit))
+    return max(0.0, estimated)
 
-st.subheader("🛑 NIFTY SL → Estimated Loss")
-st.write(f"NIFTY **{nifty:,.2f} → {sl:,.2f}** | expected premium ≈ **₹{sl_expected_premium:,.2f}** | model time proxy: **{sl_minutes:.0f} min**")
-cols=st.columns(4)
-for col,(name,p,px,loss) in zip(cols,loss_rows):
-    col.metric(name,f"₹{loss:,.0f}",f"exit premium ≈ ₹{px:,.2f}")
+# Expected premium of the EXACT selected strike at SL and Target.
+sl_expected_premium = expected_selected_premium(sl, sl_minutes)
+target_expected_premium = expected_selected_premium(target, target_minutes)
 
-st.subheader("🎯 NIFTY Target → Expected Profit")
-st.write(f"NIFTY **{nifty:,.2f} → {target:,.2f}** | expected premium ≈ **₹{target_expected_premium:,.2f}** | model time proxy: **{target_minutes:.0f} min**")
-cols=st.columns(3)
-for col,(name,p,px,profit) in zip(cols,profit_rows):
-    col.metric(name,f"₹{profit:,.0f}",f"exit premium ≈ ₹{px:,.2f}")
+# Per-share P&L for the selected contract.
+sl_pnl_per_share = sl_expected_premium - entry
+target_pnl_per_share = target_expected_premium - entry
 
-base_loss=loss_rows[1][3]
-cons_loss=loss_rows[3][3]
-base_profit=profit_rows[1][3]
-rr=(base_profit/base_loss) if base_loss else float("inf")
+# Total P&L for the selected number of lots.
+sl_pnl_total = sl_pnl_per_share * qty
+target_pnl_total = target_pnl_per_share * qty
 
-st.subheader("⚖️ Trade Summary")
-c=st.columns(5)
-for col,label,val in zip(c,["Base Loss","Conservative Loss","Base Profit","Reward : Risk","Theoretical Max Loss"],
-                         [f"₹{base_loss:,.0f}",f"₹{cons_loss:,.0f}",f"₹{base_profit:,.0f}",
-                          f"{rr:.2f}:1" if math.isfinite(rr) else "∞",f"₹{entry*qty:,.0f}"]):
-    col.metric(label,val)
+# For a long option:
+# negative P&L = loss, positive P&L = profit.
+sl_loss_total = max(0.0, -sl_pnl_total)
+target_profit_total = max(0.0, target_pnl_total)
+
+# Show the exact calculation in the sidebar.
+st.sidebar.divider()
+st.sidebar.subheader("Automatic Premium & P&L")
+
+st.sidebar.metric(
+    f"Current {opt} {strike:,.0f} Premium",
+    f"₹{entry:,.2f}"
+)
+
+st.sidebar.metric(
+    f"Expected Premium @ NIFTY {sl:,.0f}",
+    f"₹{sl_expected_premium:,.2f}"
+)
+
+if sl_pnl_total < 0:
+    st.sidebar.error(
+        f"Estimated SL Loss: ₹{sl_loss_total:,.0f}"
+    )
+else:
+    st.sidebar.success(
+        f"Estimated SL P&L: +₹{sl_pnl_total:,.0f}"
+    )
+
+st.sidebar.metric(
+    f"Expected Premium @ NIFTY {target:,.0f}",
+    f"₹{target_expected_premium:,.2f}"
+)
+
+if target_pnl_total > 0:
+    st.sidebar.success(
+        f"Estimated Target Profit: ₹{target_profit_total:,.0f}"
+    )
+else:
+    st.sidebar.warning(
+        f"Estimated Target P&L: ₹{target_pnl_total:,.0f}"
+    )
+
+st.sidebar.caption(
+    "Estimate starts from the selected strike's LIVE premium and uses "
+    "that exact contract's Delta + Gamma + Theta. IV change is not assumed."
+)
+
+# ---------- SL RESULT ----------
+st.subheader("🛑 NIFTY SL → Selected Strike Premium & Loss")
+
+st.write(
+    f"**Selected:** {strike:,.0f} {opt}  |  "
+    f"Entry premium: **₹{entry:,.2f}**  |  "
+    f"Current NIFTY: **{nifty:,.2f}**"
+)
+
+sl_cols = st.columns(4)
+sl_cols[0].metric("NIFTY SL", f"{sl:,.2f}")
+sl_cols[1].metric("Expected Premium @ SL", f"₹{sl_expected_premium:,.2f}")
+sl_cols[2].metric(
+    "P&L / Share",
+    f"₹{sl_pnl_per_share:,.2f}"
+)
+sl_cols[3].metric(
+    "Total P&L",
+    f"₹{sl_pnl_total:,.0f}"
+)
+
+if sl_pnl_total < 0:
+    st.error(
+        f"🔴 If NIFTY reaches {sl:,.2f}, the model estimates "
+        f"{strike:,.0f} {opt} premium around ₹{sl_expected_premium:,.2f}. "
+        f"Estimated loss ≈ ₹{sl_loss_total:,.0f} for {lots} lot(s)."
+    )
+else:
+    st.success(
+        f"🟢 At NIFTY {sl:,.2f}, the model estimates "
+        f"{strike:,.0f} {opt} premium around ₹{sl_expected_premium:,.2f}."
+    )
+
+# ---------- TARGET RESULT ----------
+st.subheader("🎯 NIFTY Target → Selected Strike Premium & Profit")
+
+target_cols = st.columns(4)
+target_cols[0].metric("NIFTY Target", f"{target:,.2f}")
+target_cols[1].metric(
+    "Expected Premium @ Target",
+    f"₹{target_expected_premium:,.2f}"
+)
+target_cols[2].metric(
+    "P&L / Share",
+    f"₹{target_pnl_per_share:,.2f}"
+)
+target_cols[3].metric(
+    "Total P&L",
+    f"₹{target_pnl_total:,.0f}"
+)
+
+if target_pnl_total > 0:
+    st.success(
+        f"🟢 If NIFTY reaches {target:,.2f}, the model estimates "
+        f"{strike:,.0f} {opt} premium around ₹{target_expected_premium:,.2f}. "
+        f"Estimated profit ≈ ₹{target_profit_total:,.0f} for {lots} lot(s)."
+    )
+else:
+    st.warning(
+        f"At NIFTY {target:,.2f}, the model estimates "
+        f"{strike:,.0f} {opt} premium around ₹{target_expected_premium:,.2f}."
+    )
+
+# ---------- SIMPLE TRADE SUMMARY ----------
+st.subheader("⚖️ Selected Strike Trade Summary")
+
+summary = st.columns(6)
+summary[0].metric("Strike", f"{strike:,.0f} {opt}")
+summary[1].metric("Entry Premium", f"₹{entry:,.2f}")
+summary[2].metric("SL Premium", f"₹{sl_expected_premium:,.2f}")
+summary[3].metric("SL Loss", f"₹{sl_loss_total:,.0f}")
+summary[4].metric("Target Premium", f"₹{target_expected_premium:,.2f}")
+summary[5].metric("Target Profit", f"₹{target_profit_total:,.0f}")
+
+# Approximate reward:risk based on the same selected strike.
+reward_risk = (
+    target_profit_total / sl_loss_total
+    if sl_loss_total > 0 else float("inf")
+)
+
+if math.isfinite(reward_risk):
+    st.info(
+        f"**Reward : Risk ≈ {reward_risk:.2f} : 1** "
+        f"(based on the selected {strike:,.0f} {opt} contract)."
+    )
+else:
+    st.info("Reward : Risk cannot be calculated because estimated SL loss is zero.")
 
 # ---------- OPTIONAL RISK CONTROL ----------
 if use_risk:
