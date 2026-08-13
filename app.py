@@ -27,9 +27,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Refresh the whole dashboard periodically so option LTP and live P&L update.
-# User-entered widget values are retained by Streamlit during reruns.
-st_autorefresh(interval=3000, key="nifty_live_refresh")
 
 st.markdown("""
 <style>
