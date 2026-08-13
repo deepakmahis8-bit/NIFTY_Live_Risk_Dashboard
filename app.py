@@ -27,6 +27,40 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+st.markdown("""
+<style>
+.block-container { padding-top: 1.5rem; padding-bottom: 2rem; max-width: 1500px; }
+h1 { font-size: 2.35rem !important; letter-spacing: -0.03em; }
+[data-testid="stMetric"] {
+    background: rgba(255,255,255,0.035);
+    border: 1px solid rgba(255,255,255,0.09);
+    border-radius: 14px;
+    padding: 12px 14px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.10);
+}
+[data-testid="stMetricLabel"] { font-size: 0.82rem !important; }
+[data-testid="stMetricValue"] { font-size: 1.45rem !important; }
+.stButton > button { border-radius: 10px; font-weight: 700; min-height: 42px; }
+div[data-testid="stAlert"] { border-radius: 12px; }
+section[data-testid="stSidebar"] { border-right: 1px solid rgba(255,255,255,0.08); }
+.dashboard-card {
+    border: 1px solid rgba(255,255,255,0.09);
+    border-radius: 16px;
+    padding: 18px 20px;
+    background: linear-gradient(145deg, rgba(255,255,255,0.045), rgba(255,255,255,0.015));
+    margin-bottom: 12px;
+}
+.card-title { font-size: 1.05rem; font-weight: 800; margin-bottom: 4px; }
+.card-subtitle { color: rgba(255,255,255,0.62); font-size: 0.82rem; }
+.badge {
+    display:inline-block; padding:4px 9px; border-radius:999px;
+    font-size:0.72rem; font-weight:800; margin-left:7px;
+}
+.badge-live { background:rgba(34,197,94,.16); color:#4ade80; }
+.badge-readonly { background:rgba(59,130,246,.16); color:#60a5fa; }
+</style>
+""", unsafe_allow_html=True)
+
 MASTER_URL = (
     "https://margincalculator.angelbroking.com/"
     "OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -391,6 +425,18 @@ if ltp <= 0:
 
 entry = ltp
 
+# User's exact demat execution/fill price.
+manual_entry = st.sidebar.number_input(
+    "📝 My Actual Buy Premium",
+    min_value=0.05,
+    value=float(round(ltp, 2)),
+    step=0.05,
+    format="%.2f",
+    help="Enter the exact premium at which your demat order was filled. "
+         "Live P&L and SL/Target rupee P&L use this price.",
+)
+entry = float(manual_entry)
+
 # ---------- GREEKS ----------
 
 greek = None
@@ -449,7 +495,7 @@ t_now = expiry_fraction_years(expiry)
 
 # Calibrate IV to the ACTUAL selected contract LTP.
 calibrated_iv = implied_vol_from_price(
-    entry,
+    ltp,
     nifty,
     strike,
     t_now,
@@ -511,7 +557,11 @@ target_high = projected_premium(
     target, calibrated_iv + iv_shift / 100.0
 )
 
-# P&L for a LONG option position.
+# LONG option P&L.
+# Actual/live P&L uses the user's exact demat fill price.
+live_pnl_per_share = ltp - entry
+live_pnl_total = live_pnl_per_share * qty
+
 sl_pnl_per_share = sl_base - entry
 target_pnl_per_share = target_base - entry
 
@@ -520,6 +570,9 @@ target_pnl_total = target_pnl_per_share * qty
 
 sl_loss_total = max(0.0, -sl_pnl_total)
 target_profit_total = max(0.0, target_pnl_total)
+
+sl_loss_per_share = max(0.0, entry - sl_base)
+target_profit_per_share = max(0.0, target_base - entry)
 
 # P&L ranges from IV scenario.
 sl_pnl_low = (sl_low - entry) * qty
@@ -568,6 +621,46 @@ for col, label, value in zip(
 ):
     col.metric(label, value)
 
+st.divider()
+st.subheader("💼 My Actual Position")
+
+pos = st.columns(5)
+pos[0].metric("My Buy Price", fmt_inr(entry))
+pos[1].metric("Live Premium", fmt_inr(ltp))
+pos[2].metric(
+    "Live P&L",
+    f"{'+' if live_pnl_total >= 0 else ''}{fmt_inr(live_pnl_total)}"
+)
+pos[3].metric(
+    "P&L / Unit",
+    f"{'+' if live_pnl_per_share >= 0 else ''}{fmt_inr(live_pnl_per_share)}"
+)
+pos[4].metric("Position Qty", f"{qty:,}")
+
+if live_pnl_total > 0:
+    st.success(
+        f"🟢 Current position: **+{fmt_inr(live_pnl_total)}** "
+        f"({fmt_inr(live_pnl_per_share)} per unit)."
+    )
+elif live_pnl_total < 0:
+    st.error(
+        f"🔴 Current position: **{fmt_inr(live_pnl_total)}** "
+        f"({fmt_inr(live_pnl_per_share)} per unit)."
+    )
+else:
+    st.info("⚪ Current premium is equal to your entered buy price.")
+
+st.caption(
+    "Live P&L = (current option LTP − your actual buy premium) × total quantity. "
+    "Brokerage, taxes and charges are excluded."
+)
+st.markdown(
+    '<div class="card-subtitle">💡 <b>Quick workflow:</b> Choose strike → enter actual demat buy premium → '
+    'set NIFTY SL/Target → refresh for live P&L.</div>',
+    unsafe_allow_html=True,
+)
+
+
 st.subheader("🧮 Selected Contract Greeks")
 gc = st.columns(5)
 for col, label, value in zip(
@@ -609,10 +702,15 @@ with sl_col:
         )
 
     st.write(
-        f"**P&L / unit:** {fmt_inr(sl_pnl_per_share)}"
+        f"**Expected loss / unit:** {fmt_inr(-sl_loss_per_share) if sl_loss_per_share > 0 else fmt_inr(sl_pnl_per_share)}"
+    )
+    st.write(
+        f"**Expected SL loss:** {fmt_inr(sl_loss_total)} for {lots} lot(s)"
+        if sl_loss_total > 0
+        else f"**Expected SL P&L:** {fmt_inr(sl_pnl_total)}"
     )
     st.caption(
-        f"IV scenario range: {fmt_inr(sl_low)} – {fmt_inr(sl_high)}"
+        f"IV scenario premium range: {fmt_inr(sl_low)} – {fmt_inr(sl_high)}"
     )
 
 with target_col:
@@ -634,10 +732,17 @@ with target_col:
         )
 
     st.write(
-        f"**P&L / unit:** {fmt_inr(target_pnl_per_share)}"
+        f"**Expected profit / unit:** {fmt_inr(target_profit_per_share)}"
+        if target_profit_per_share > 0
+        else f"**Expected P&L / unit:** {fmt_inr(target_pnl_per_share)}"
+    )
+    st.write(
+        f"**Expected target profit:** {fmt_inr(target_profit_total)} for {lots} lot(s)"
+        if target_profit_total > 0
+        else f"**Expected target P&L:** {fmt_inr(target_pnl_total)}"
     )
     st.caption(
-        f"IV scenario range: {fmt_inr(target_low)} – {fmt_inr(target_high)}"
+        f"IV scenario premium range: {fmt_inr(target_low)} – {fmt_inr(target_high)}"
     )
 
 # ---------- SUMMARY ----------
@@ -652,11 +757,11 @@ reward_risk = (
 )
 
 summary = st.columns(6)
-summary[0].metric("Entry Premium", fmt_inr(entry))
-summary[1].metric("SL Premium", fmt_inr(sl_base))
-summary[2].metric("SL Loss", fmt_inr(sl_loss_total))
-summary[3].metric("Target Premium", fmt_inr(target_base))
-summary[4].metric("Target Profit", fmt_inr(target_profit_total))
+summary[0].metric("My Buy Price", fmt_inr(entry))
+summary[1].metric("Live Premium", fmt_inr(ltp))
+summary[2].metric("Expected SL Loss", fmt_inr(sl_loss_total))
+summary[3].metric("Expected SL Premium", fmt_inr(sl_base))
+summary[4].metric("Expected Target Profit", fmt_inr(target_profit_total))
 summary[5].metric(
     "Reward : Risk",
     f"{reward_risk:.2f} : 1" if reward_risk is not None else "N/A",
@@ -704,7 +809,9 @@ st.info(
 
 st.caption(
     calibration_note
-    + " This is a theoretical estimate, not a guaranteed future LTP or fill."
+    + " Your actual buy price is used for live P&L and SL/Target rupee P&L. "
+      "Automatic Angel One LTP is used for market display and IV calibration. "
+      "This is a theoretical estimate, not a guaranteed future LTP or fill."
 )
 
 # ---------- OPTIONAL RISK LIMIT ----------
@@ -751,3 +858,7 @@ with st.expander("🛡️ Optional Maximum Loss Control"):
 st.divider()
 if st.button("🔄 Refresh Live Data", use_container_width=True):
     st.rerun()
+
+st.caption(
+    "Refresh the app to pull the latest Angel One premium and update Live P&L."
+)
