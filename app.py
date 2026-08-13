@@ -402,11 +402,21 @@ rows = [
 ]
 strikes = sorted({x["strike"] for x in rows})
 
-near = min(strikes, key=lambda s: abs(s - nifty))
+# Keep user's manually selected strike fixed across every Streamlit rerun/refresh.
+# Only initialize a strike automatically the first time for this Expiry + CE/PE.
+strike_state_key = f"selected_strike_{expiry.isoformat()}_{opt}"
+
+if (
+    strike_state_key not in st.session_state
+    or st.session_state[strike_state_key] not in strikes
+):
+    near = min(strikes, key=lambda s: abs(s - nifty))
+    st.session_state[strike_state_key] = near
+
 strike = st.sidebar.selectbox(
     "Strike",
     strikes,
-    index=strikes.index(near),
+    key=strike_state_key,
     format_func=lambda s: f"{s:,.0f}",
 )
 
