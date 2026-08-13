@@ -92,6 +92,8 @@ try:
         raise RuntimeError(f"Angel One API error: {msg}")
 
     data = n.get("data")
+
+    st.write("DEBUG NIFTY RESPONSE:", n)
     
     
     if isinstance(data, dict) and isinstance(data.get("fetched"), list):
