@@ -141,7 +141,12 @@ contract=next(x for x in rows if x["strike"]==strike)
 
 lots=st.sidebar.number_input("Lots",1,1000,1,1)
 qty=lots*contract["lotsize"]
-entry=st.sidebar.number_input("Entry Premium ₹",0.05,100000.0,100.0,0.05)
+
+# These placeholders are filled automatically after Angel One returns the live quote/model.
+current_premium_box=st.sidebar.empty()
+sl_premium_box=st.sidebar.empty()
+target_premium_box=st.sidebar.empty()
+
 sl=st.sidebar.number_input("NIFTY SL",value=float(round(nifty/50)*50-50),step=50.0)
 target=st.sidebar.number_input("NIFTY Target",value=float(round(nifty/50)*50+150),step=50.0)
 
@@ -166,6 +171,14 @@ volume=num(q.get("tradeVolume") or q.get("volume"))
 oi=num(q.get("opnInterest") or q.get("openInterest"))
 avg=num(q.get("avgPrice") or q.get("averagePrice"))
 high=num(q.get("high")); low=num(q.get("low"))
+
+if ltp <= 0:
+    st.error("Selected option has no valid live premium from Angel One.")
+    st.stop()
+
+# Current premium is fetched automatically for the selected expiry/option/strike.
+entry=ltp
+current_premium_box.metric("Current Premium", f"₹{ltp:,.2f}")
 
 # ---------- GREEKS ----------
 greek=None
@@ -211,6 +224,12 @@ def theoretical_premium(level,minutes,iv_shift):
     p=ltp + delta*d + 0.5*gamma*d*d + theta*(minutes/(24*60)) + vega*iv_shift
     return max(0.0,p)
 
+# Base-case expected premiums at the user-selected NIFTY levels.
+sl_expected_premium=theoretical_premium(sl,sl_minutes,0.0)
+target_expected_premium=theoretical_premium(target,target_minutes,0.0)
+sl_premium_box.metric("Expected Premium @ NIFTY SL", f"₹{sl_expected_premium:,.2f}")
+target_premium_box.metric("Expected Premium @ NIFTY Target", f"₹{target_expected_premium:,.2f}")
+
 def exit_reference(p):
     # For a long option, the executable-side reference is bid.
     # If bid is unavailable, fall back to model price.
@@ -243,13 +262,13 @@ for name,iv_shift,stress in profit_defs:
     profit_rows.append((name,p,px,profit))
 
 st.subheader("🛑 NIFTY SL → Estimated Loss")
-st.write(f"NIFTY **{nifty:,.2f} → {sl:,.2f}** | model time proxy: **{sl_minutes:.0f} min**")
+st.write(f"NIFTY **{nifty:,.2f} → {sl:,.2f}** | expected premium ≈ **₹{sl_expected_premium:,.2f}** | model time proxy: **{sl_minutes:.0f} min**")
 cols=st.columns(4)
 for col,(name,p,px,loss) in zip(cols,loss_rows):
     col.metric(name,f"₹{loss:,.0f}",f"exit premium ≈ ₹{px:,.2f}")
 
 st.subheader("🎯 NIFTY Target → Expected Profit")
-st.write(f"NIFTY **{nifty:,.2f} → {target:,.2f}** | model time proxy: **{target_minutes:.0f} min**")
+st.write(f"NIFTY **{nifty:,.2f} → {target:,.2f}** | expected premium ≈ **₹{target_expected_premium:,.2f}** | model time proxy: **{target_minutes:.0f} min**")
 cols=st.columns(3)
 for col,(name,p,px,profit) in zip(cols,profit_rows):
     col.metric(name,f"₹{profit:,.0f}",f"exit premium ≈ ₹{px:,.2f}")
