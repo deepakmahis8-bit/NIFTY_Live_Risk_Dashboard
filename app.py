@@ -27,6 +27,10 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Refresh the whole dashboard periodically so option LTP and live P&L update.
+# User-entered widget values are retained by Streamlit during reruns.
+st_autorefresh(interval=3000, key="nifty_live_refresh")
+
 st.markdown("""
 <style>
 .block-container { padding-top: 1.5rem; padding-bottom: 2rem; max-width: 1500px; }
@@ -186,6 +190,49 @@ def expiry_fraction_years(expiry):
     return seconds / (365.0 * 24.0 * 3600.0)
 
 
+def iv_from_surface(greek_rows, option_type, fixed_strike, current_spot, future_spot, fallback_iv):
+    """
+    Estimate future IV for the SAME fixed strike by using the live IV smile
+    returned by Angel One across strikes.
+
+    We map the fixed strike's future moneyness (K / future_spot) to the
+    closest current strikes' moneyness (K_i / current_spot), then linearly
+    interpolate IV. This is a market-aware IV-skew adjustment rather than
+    assuming IV stays completely flat.
+    """
+    pts = []
+    for g in greek_rows:
+        if str(g.get("optionType", "")).upper() != option_type:
+            continue
+        k = norm_greek_strike(g.get("strikePrice"))
+        iv = num(g.get("impliedVolatility"))
+        if k > 0 and iv > 0:
+            pts.append((k / current_spot, iv / 100.0))
+
+    if len(pts) < 3 or current_spot <= 0 or future_spot <= 0:
+        return fallback_iv, False
+
+    pts.sort(key=lambda x: x[0])
+    desired = fixed_strike / future_spot
+
+    # Linear interpolation in moneyness; clamp outside the available surface.
+    if desired <= pts[0][0]:
+        return pts[0][1], False
+    if desired >= pts[-1][0]:
+        return pts[-1][1], False
+
+    for (m1, iv1), (m2, iv2) in zip(pts, pts[1:]):
+        if m1 <= desired <= m2:
+            w = (desired - m1) / max(m2 - m1, 1e-12)
+            return iv1 + w * (iv2 - iv1), True
+
+    return fallback_iv, False
+
+
+def clamp_iv(iv):
+    return min(max(iv, 0.0001), 5.0)
+
+
 # ---------- MASTER ----------
 
 @st.cache_data(ttl=3600)
@@ -323,6 +370,17 @@ try:
     if nifty <= 0:
         raise RuntimeError(f"Invalid NIFTY LTP: {ltp_value}")
 
+    # Best-effort intraday range from the same NIFTY quote.
+    nifty_high = num(
+        data.get("high") if isinstance(data, dict) else None
+    )
+    nifty_low = num(
+        data.get("low") if isinstance(data, dict) else None
+    )
+    if isinstance(data, list) and data:
+        nifty_high = num(data[0].get("high"), nifty_high)
+        nifty_low = num(data[0].get("low"), nifty_low)
+
 except Exception as e:
     st.error(f"NIFTY live price error: {e}")
     st.stop()
@@ -381,6 +439,9 @@ target = st.sidebar.number_input(
     step=50.0,
 )
 
+# Time-to-level is estimated automatically from NIFTY's current
+# intraday range/volatility. No manual time input is required.
+
 # Advanced assumptions
 with st.sidebar.expander("⚙️ Model Assumptions", expanded=False):
     rate_pct = st.number_input(
@@ -428,14 +489,20 @@ entry = ltp
 # User's exact demat execution/fill price.
 manual_entry = st.sidebar.number_input(
     "📝 My Actual Buy Premium",
-    min_value=0.05,
-    value=float(round(ltp, 2)),
+    min_value=0.0,
+    value=0.0,
     step=0.05,
     format="%.2f",
-    help="Enter the exact premium at which your demat order was filled. "
-         "Live P&L and SL/Target rupee P&L use this price.",
+    key="manual_entry_price",
+    help="Enter the exact premium at which your demat order was filled."
 )
 entry = float(manual_entry)
+
+if entry <= 0:
+    st.sidebar.warning("Enter your actual demat buy premium to activate Live P&L.")
+
+if entry <= 0:
+    st.sidebar.warning("Enter your actual demat buy premium to activate Live P&L.")
 
 # ---------- GREEKS ----------
 
@@ -459,9 +526,10 @@ try:
             else str(gd)
         )
 
+    all_greeks = gdata
     greek = next(
         (
-            g for g in gdata
+            g for g in all_greeks
             if str(g.get("optionType", "")).upper() == opt
             and abs(norm_greek_strike(g.get("strikePrice")) - strike) < 1.0
         ),
@@ -486,6 +554,39 @@ gamma = num(greek.get("gamma"))
 theta = num(greek.get("theta"))
 vega = num(greek.get("vega"))
 angel_iv_pct = num(greek.get("impliedVolatility"))
+
+# ---------- AUTOMATIC TIME ESTIMATE ----------
+
+# Estimate NIFTY's typical movement speed from today's available range.
+# This is intentionally conservative and is only used to estimate theta
+# exposure; the user does not need to enter a time.
+if nifty_high > nifty_low > 0:
+    intraday_range = nifty_high - nifty_low
+else:
+    intraday_range = max(nifty * 0.003, 50.0)
+
+# Approximate active-market minutes elapsed today.
+now_ist = datetime.now(IST)
+market_open = datetime.combine(now_ist.date(), time(9, 15), tzinfo=IST)
+market_close = datetime.combine(now_ist.date(), time(15, 30), tzinfo=IST)
+elapsed_minutes = max(
+    30.0,
+    min(
+        375.0,
+        (now_ist - market_open).total_seconds() / 60.0
+    )
+)
+
+# Movement speed is smoothed so a very narrow/wide first few minutes
+# does not create an absurdly small/large time estimate.
+range_speed = intraday_range / max(elapsed_minutes, 30.0)
+range_speed = max(range_speed, nifty * 0.00025)
+
+sl_distance = abs(sl - nifty)
+target_distance = abs(target - nifty)
+
+sl_minutes = max(2.0, min(240.0, sl_distance / range_speed))
+target_minutes = max(2.0, min(240.0, target_distance / range_speed))
 
 # ---------- MODEL ----------
 
@@ -524,46 +625,59 @@ else:
         "so the model starts from the actual observed premium."
     )
 
-def projected_premium(nifty_level, iv):
+# Market-aware IV surface for SL/Target.
+sl_surface_iv, sl_surface_ok = iv_from_surface(
+    all_greeks, opt, strike, nifty, sl, calibrated_iv
+)
+target_surface_iv, target_surface_ok = iv_from_surface(
+    all_greeks, opt, strike, nifty, target, calibrated_iv
+)
+
+def projected_premium(nifty_level, iv, minutes_to_level):
+    # Reduce time-to-expiry by the expected travel time to the level.
+    t_future = max(
+        60.0 / (365.0 * 24.0 * 3600.0),
+        t_now - (minutes_to_level * 60.0) / (365.0 * 24.0 * 3600.0),
+    )
     return max(
         0.0,
         bs_price(
             nifty_level,
             strike,
-            t_now,
+            t_future,
             rate,
             div_yield,
-            iv,
+            clamp_iv(iv),
             opt,
         ),
     )
 
-# Base constant-IV estimate
-sl_base = projected_premium(sl, calibrated_iv)
-target_base = projected_premium(target, calibrated_iv)
+# Base estimate uses live IV smile/skew adjusted for the future NIFTY level.
+sl_base = projected_premium(sl, sl_surface_iv, sl_minutes)
+target_base = projected_premium(target, target_surface_iv, target_minutes)
 
-# Uncertainty band from IV shock.
+# IV uncertainty around the surface-adjusted estimate.
 sl_low = projected_premium(
-    sl, max(0.0001, calibrated_iv - iv_shift / 100.0)
+    sl, max(0.0001, sl_surface_iv - iv_shift / 100.0), sl_minutes
 )
 sl_high = projected_premium(
-    sl, calibrated_iv + iv_shift / 100.0
+    sl, sl_surface_iv + iv_shift / 100.0, sl_minutes
 )
 
 target_low = projected_premium(
-    target, max(0.0001, calibrated_iv - iv_shift / 100.0)
+    target, max(0.0001, target_surface_iv - iv_shift / 100.0), target_minutes
 )
 target_high = projected_premium(
-    target, calibrated_iv + iv_shift / 100.0
+    target, target_surface_iv + iv_shift / 100.0, target_minutes
 )
 
 # LONG option P&L.
 # Actual/live P&L uses the user's exact demat fill price.
-live_pnl_per_share = ltp - entry
-live_pnl_total = live_pnl_per_share * qty
+live_pnl_per_share = (ltp - entry) if entry > 0 else 0.0
+live_pnl_total = live_pnl_per_share * qty if entry > 0 else 0.0
 
-sl_pnl_per_share = sl_base - entry
-target_pnl_per_share = target_base - entry
+sl_pnl_per_share = (sl_base - entry) if entry > 0 else 0.0
+target_pnl_per_share = (target_base - entry) if entry > 0 else 0.0
 
 sl_pnl_total = sl_pnl_per_share * qty
 target_pnl_total = target_pnl_per_share * qty
@@ -583,6 +697,22 @@ target_pnl_high = (target_high - entry) * qty
 spread = ask - bid if bid > 0 and ask > 0 else 0.0
 spread_pct = spread / ltp * 100.0 if ltp > 0 else 0.0
 
+# Simple model-quality score (not a probability of correctness).
+confidence_score = 100.0
+if spread_pct > 1.0:
+    confidence_score -= min(25.0, spread_pct * 8.0)
+if volume < 1000:
+    confidence_score -= 10.0
+if oi <= 0:
+    confidence_score -= 10.0
+if not sl_surface_ok:
+    confidence_score -= 8.0
+if not target_surface_ok:
+    confidence_score -= 8.0
+if t_now < 2 / (365 * 24):
+    confidence_score -= 15.0
+confidence_score = max(0.0, min(100.0, confidence_score))
+
 # ---------- HEADER ----------
 
 st.title("📈 NIFTY CE/PE — Advanced Risk Engine")
@@ -591,14 +721,37 @@ st.caption(
     "Selected-strike premium projection"
 )
 
+refresh_col1, refresh_col2 = st.columns([1, 5])
+with refresh_col1:
+    if st.button("🔄 Refresh Live Data", use_container_width=True):
+        st.rerun()
+with refresh_col2:
+    st.caption("Refresh to fetch the latest NIFTY and selected-strike premium from Angel One.")
+
 # ---------- TOP TRADE CARD ----------
 
 top = st.columns(5)
 top[0].metric("NIFTY", f"{nifty:,.2f}")
 top[1].metric("Selected", f"{strike:,.0f} {opt}")
-top[2].metric("Live Premium", fmt_inr(entry))
+top[2].metric("Live Premium", fmt_inr(ltp))
 top[3].metric("Lots", f"{lots} × {contract['lotsize']}")
 top[4].metric("Position Qty", f"{qty:,}")
+
+st.markdown(
+    f"""
+    <div class="dashboard-card">
+        <div class="card-title">🎯 Selected Strike — {strike:,.0f} {opt}</div>
+        <div class="card-subtitle">Automatic live premium fetched from Angel One for this exact contract</div>
+        <div style="font-size:2rem;font-weight:800;margin-top:8px;">
+            {fmt_inr(ltp)}
+            <span style="font-size:.85rem;color:rgba(255,255,255,.60);font-weight:500;">
+                Live Premium
+            </span>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.divider()
 
@@ -651,15 +804,36 @@ else:
     st.info("⚪ Current premium is equal to your entered buy price.")
 
 st.caption(
-    "Live P&L = (current option LTP − your actual buy premium) × total quantity. "
+    "Live P&L = (current Angel One LTP − your actual demat buy premium) × total quantity. "
     "Brokerage, taxes and charges are excluded."
 )
+if entry > 0:
+    st.success(
+        f"Live: {fmt_inr(ltp)} | Your Buy: {fmt_inr(entry)} | "
+        f"Difference: {fmt_inr(live_pnl_per_share)} per unit"
+    )
+else:
+    st.info("Enter your actual demat buy premium in the sidebar. The live premium above is fetched automatically.")
 st.markdown(
     '<div class="card-subtitle">💡 <b>Quick workflow:</b> Choose strike → enter actual demat buy premium → '
     'set NIFTY SL/Target → refresh for live P&L.</div>',
     unsafe_allow_html=True,
 )
 
+
+st.subheader("🧠 Projection Inputs")
+pc = st.columns(5)
+pc[0].metric("Auto Time to SL", f"~{sl_minutes:.0f} min")
+pc[1].metric("SL IV", f"{sl_surface_iv * 100:.2f}%")
+pc[2].metric("Auto Time to Target", f"~{target_minutes:.0f} min")
+pc[3].metric("Target IV", f"{target_surface_iv * 100:.2f}%")
+pc[4].metric("Model Score", f"{confidence_score:.0f}/100")
+
+st.caption(
+    "SL/Target IV is adjusted from Angel One's live multi-strike IV surface. "
+    "Time-to-level is estimated automatically from NIFTY's available intraday range; "
+    "you do not need to enter any time."
+)
 
 st.subheader("🧮 Selected Contract Greeks")
 gc = st.columns(5)
@@ -773,7 +947,7 @@ st.divider()
 st.subheader("🧠 Estimate Quality")
 
 q1, q2, q3 = st.columns(3)
-q1.metric("Calibrated IV", f"{calibrated_iv * 100:.2f}%")
+q1.metric("Current Calibrated IV", f"{calibrated_iv * 100:.2f}%")
 q2.metric("IV Scenario", f"±{iv_shift:.1f} pts")
 q3.metric("Bid/Ask Spread", f"{spread_pct:.2f}%")
 
@@ -782,6 +956,11 @@ warnings = []
 if spread_pct > 1.0:
     warnings.append(
         f"Bid/ask spread is {spread_pct:.2f}% of premium."
+    )
+if not sl_surface_ok or not target_surface_ok:
+    warnings.append(
+        "One projection is outside/interpolated beyond the available IV smile; "
+        "that estimate is less reliable."
     )
 if volume < 1000:
     warnings.append("Option volume is relatively low.")
@@ -798,13 +977,15 @@ else:
     st.success("🟢 Live data quality looks reasonable.")
 
 st.info(
-    "How this estimate works: the app first anchors the model to the "
-    "LIVE premium of the exact selected strike. It then calibrates IV to "
-    "that premium and reprices the SAME contract at your NIFTY SL/Target "
-    "with the same expiry. The main number assumes IV stays unchanged. "
-    "The displayed range shows what happens if IV is ± the selected "
-    "scenario amount. Actual market premium can still differ because IV, "
-    "spread, liquidity and time-to-hit can change."
+    "How this estimate works: the app anchors the model to the LIVE premium "
+    "of the exact selected strike, calibrates IV to that observed price, "
+    "then uses Angel One's live multi-strike IV smile to estimate how IV may "
+    "shift when NIFTY moves to your SL/Target. It automatically estimates the "
+    "travel time from NIFTY's available intraday range and reduces time-to-expiry "
+    "accordingly. The IV scenario range shows sensitivity "
+    "to further IV changes. Actual premium can still differ because markets "
+    "can move non-linearly, spreads/liquidity change, and the assumed travel "
+    "time may be wrong."
 )
 
 st.caption(
@@ -860,5 +1041,5 @@ if st.button("🔄 Refresh Live Data", use_container_width=True):
     st.rerun()
 
 st.caption(
-    "Refresh the app to pull the latest Angel One premium and update Live P&L."
+    "Live refresh: every 3 seconds. You can also use the button below for an immediate refresh."
 )
