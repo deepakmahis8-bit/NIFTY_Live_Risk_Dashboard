@@ -4,6 +4,11 @@ from datetime import datetime, time
 from zoneinfo import ZoneInfo
 import requests
 import math
+import json
+import os
+import tempfile
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ============================================================
 # NIFTY CE/PE — Advanced Risk Engine
@@ -62,10 +67,21 @@ section[data-testid="stSidebar"] { border-right: 1px solid rgba(255,255,255,0.08
 </style>
 """, unsafe_allow_html=True)
 
-MASTER_URL = (
-    "https://margincalculator.angelbroking.com/"
-    "OpenAPI_File/files/OpenAPIScripMaster.json"
+# Angel One instrument-master endpoints.
+# Multiple Angel-owned hostnames are used so one slow endpoint does not
+# take the whole dashboard down.
+MASTER_URLS = (
+    "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json",
+    "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
 )
+
+# Last-good local copy. Streamlit Cloud local storage may reset on a full
+# redeploy, but this still protects normal reruns and temporary outages.
+MASTER_CACHE_FILE = os.path.join(
+    tempfile.gettempdir(), "angelone_openapi_scrip_master.json"
+)
+MASTER_CACHE_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+
 IST = ZoneInfo("Asia/Kolkata")
 
 # ---------- SMALL HELPERS ----------
@@ -232,11 +248,147 @@ def clamp_iv(iv):
 
 # ---------- MASTER ----------
 
-@st.cache_data(ttl=3600)
+def _build_retry_session():
+    """Create a requests session with retry + exponential backoff."""
+    retry = Retry(
+        total=4,
+        connect=4,
+        read=4,
+        status=4,
+        backoff_factor=1.5,
+        status_forcelist=(408, 429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=10,
+        pool_maxsize=10,
+    )
+
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 NIFTY-Risk-Engine/1.0",
+            "Accept": "application/json,text/plain,*/*",
+            "Connection": "keep-alive",
+        }
+    )
+    return session
+
+
+def _validate_master(data):
+    """Reject empty, malformed or non-Angel instrument-master responses."""
+    if not isinstance(data, list) or len(data) < 1000:
+        rows = len(data) if isinstance(data, list) else "N/A"
+        raise ValueError(
+            f"Instrument master payload is invalid "
+            f"(type={type(data).__name__}, rows={rows})."
+        )
+
+    sample = data[:2000]
+    if not any(
+        isinstance(x, dict)
+        and "token" in x
+        and "symbol" in x
+        and "exch_seg" in x
+        for x in sample
+    ):
+        raise ValueError(
+            "Instrument master JSON does not contain expected Angel contract fields."
+        )
+
+    return data
+
+
+def _read_disk_master():
+    """Return the last-good cached master if it is not older than 7 days."""
+    try:
+        if not os.path.exists(MASTER_CACHE_FILE):
+            return None
+
+        age = max(
+            0.0,
+            datetime.now().timestamp() - os.path.getmtime(MASTER_CACHE_FILE),
+        )
+        if age > MASTER_CACHE_MAX_AGE_SECONDS:
+            return None
+
+        with open(MASTER_CACHE_FILE, "r", encoding="utf-8") as f:
+            return _validate_master(json.load(f))
+
+    except Exception:
+        return None
+
+
+def _write_disk_master(data):
+    """Atomically save the last successful master without risking corruption."""
+    try:
+        tmp_file = MASTER_CACHE_FILE + ".tmp"
+
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, separators=(",", ":"))
+
+        os.replace(tmp_file, MASTER_CACHE_FILE)
+
+    except Exception:
+        # Cache-write failure must never break the dashboard.
+        pass
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
 def load_master():
-    r = requests.get(MASTER_URL, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    """
+    Robust Angel One instrument-master loader.
+
+    Order:
+    1) Primary Angel endpoint
+    2) Automatic retries/backoff
+    3) Secondary Angel endpoint
+    4) Last-good local cache
+    5) Fail only if every source is unavailable
+    """
+    session = _build_retry_session()
+    errors = []
+
+    for url in MASTER_URLS:
+        try:
+            r = session.get(url, timeout=(10, 60))
+            r.raise_for_status()
+
+            content_type = (r.headers.get("Content-Type") or "").lower()
+            body_start = r.text.lstrip()[:1]
+
+            if "json" not in content_type and body_start not in ("[", "{"):
+                raise ValueError(
+                    f"Unexpected response type from {url}: "
+                    f"{content_type or 'unknown content-type'}"
+                )
+
+            data = _validate_master(r.json())
+
+            _write_disk_master(data)
+
+            return data
+
+        except Exception as e:
+            errors.append(
+                f"{url} -> {type(e).__name__}: {e}"
+            )
+
+    stale = _read_disk_master()
+
+    if stale is not None:
+        return stale
+
+    raise RuntimeError(
+        "Angel One instrument master is unavailable from all configured "
+        "endpoints and no usable last-good cache exists. "
+        + " | ".join(errors)
+    )
 
 
 # ---------- LOGIN ----------
@@ -296,7 +448,16 @@ obj = st.session_state.obj
 try:
     master = load_master()
 except Exception as e:
-    st.error(f"Could not load Angel One instrument master: {e}")
+    st.error(
+        "Angel One instrument master could not be loaded. "
+        "The app already tried multiple Angel endpoints, automatic retries, "
+        "and the last-good cache."
+    )
+    st.code(str(e))
+    st.info(
+        "Your Angel One login may still be connected. This error only means "
+        "the contract-master service is unavailable at the moment."
+    )
     st.stop()
 
 today = datetime.now(IST).date()
@@ -504,9 +665,6 @@ manual_entry = st.sidebar.number_input(
     help="Enter the exact premium at which your demat order was filled."
 )
 entry = float(manual_entry)
-
-if entry <= 0:
-    st.sidebar.warning("Enter your actual demat buy premium to activate Live P&L.")
 
 if entry <= 0:
     st.sidebar.warning("Enter your actual demat buy premium to activate Live P&L.")
